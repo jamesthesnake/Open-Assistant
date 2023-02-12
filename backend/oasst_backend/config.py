@@ -14,7 +14,7 @@ class TreeManagerConfiguration(BaseModel):
     number is reached."""
 
     max_initial_prompt_review: int = 100
-    """Maximum number of initial prompts under review before no more inital prompt tasks will be handed out."""
+    """Maximum number of initial prompts under review before no more initial prompt tasks will be handed out."""
 
     max_tree_depth: int = 3
     """Maximum depth of message tree."""
@@ -47,7 +47,7 @@ class TreeManagerConfiguration(BaseModel):
     """Automatically set tree state to `halted_by_moderator` when more than the specified number
     of users skip replying to a message. (auto moderation)"""
 
-    auto_mod_red_flags: int = 3
+    auto_mod_red_flags: int = 4
     """Delete messages that receive more than this number of red flags if it is a reply or
     set the tree to `aborted_low_grade` when a prompt is flagged. (auto moderation)"""
 
@@ -75,7 +75,7 @@ class TreeManagerConfiguration(BaseModel):
 
     min_active_rankings_per_lang: int = 0
     """When the number of active ranking tasks is below this value when a tree enters a terminal
-    state an available trees in BACKLOG_RANKING will be actived (i.e. enters the RANKING state)."""
+    state an available trees in BACKLOG_RANKING will be activated (i.e. enters the RANKING state)."""
 
     labels_initial_prompt: list[TextLabel] = [
         TextLabel.spam,
@@ -111,8 +111,8 @@ class TreeManagerConfiguration(BaseModel):
         TextLabel.spam,
         TextLabel.lang_mismatch,
         TextLabel.quality,
-        TextLabel.humor,
         TextLabel.creativity,
+        TextLabel.humor,
         TextLabel.toxicity,
         TextLabel.violence,
         TextLabel.not_appropriate,
@@ -138,7 +138,7 @@ class TreeManagerConfiguration(BaseModel):
     p_lonely_child_extension: float = 0.75
     """Probability to select a prompter message parent with less than lonely_children_count children."""
 
-    recent_tasks_span_sec: int = 3 * 60  # 3 min
+    recent_tasks_span_sec: int = 5 * 60  # 5 min
     """Time in seconds of recent tasks to consider for exclusion during task selection."""
 
 
@@ -182,6 +182,7 @@ class Settings(BaseSettings):
         Path(__file__).parent.parent / "test_data/realistic/realistic_seed_data.json"
     )
     DEBUG_ALLOW_SELF_LABELING: bool = False  # allow users to label their own messages
+    DEBUG_ALLOW_SELF_RANKING: bool = False  # allow users to rank their own messages
     DEBUG_ALLOW_DUPLICATE_TASKS: bool = False  # offer users tasks to which they already responded
     DEBUG_SKIP_EMBEDDING_COMPUTATION: bool = False
     DEBUG_SKIP_TOXICITY_CALCULATION: bool = False
@@ -195,6 +196,8 @@ class Settings(BaseSettings):
     HUGGING_FACE_API_KEY: str = ""
 
     ROOT_TOKENS: List[str] = ["1234"]  # supply a string that can be parsed to a json list
+
+    ENABLE_PROM_METRICS: bool = True  # enable prometheus metrics at /metrics
 
     @validator("DATABASE_URI", pre=True)
     def assemble_db_connection(cls, v: Optional[str], values: Dict[str, Any]) -> Any:
@@ -239,6 +242,8 @@ class Settings(BaseSettings):
         if v < 1:
             raise ValueError(v)
         return v
+
+    CACHED_STATS_UPDATE_INTERVAL: int = 60  # minutes
 
     RATE_LIMIT_TASK_USER_TIMES: int = 60
     RATE_LIMIT_TASK_USER_MINUTES: int = 5

@@ -7,12 +7,14 @@ from typing import Optional
 from uuid import UUID, uuid4
 
 import oasst_backend.models.db_payload as db_payload
+import sqlalchemy.dialects.postgresql as pg
 from loguru import logger
 from oasst_backend.api.deps import FrontendUserId
 from oasst_backend.config import settings
 from oasst_backend.journal_writer import JournalWriter
 from oasst_backend.models import (
     ApiClient,
+    FlaggedMessage,
     Message,
     MessageEmbedding,
     MessageEmoji,
@@ -484,7 +486,7 @@ class PromptRepository:
                     OasstErrorCode.TASK_PAYLOAD_TYPE_MISMATCH,
                 )
 
-            logger.debug(f"text_labels relpy: {valid_labels=}, {mandatory_labels=}")
+            logger.debug(f"text_labels reply: {valid_labels=}, {mandatory_labels=}")
 
             if valid_labels:
                 if not all([label in valid_labels for label in text_labels.labels.keys()]):
@@ -553,7 +555,12 @@ class PromptRepository:
         self.db.add(model)
         return model, task, message
 
-    def fetch_random_message_tree(self, require_role: str = None, reviewed: bool = True) -> list[Message]:
+    def fetch_random_message_tree(
+        self,
+        require_role: str = None,
+        review_result: Optional[bool] = True,
+        deleted: Optional[bool] = False,
+    ) -> list[Message]:
         """
         Loads all messages of a random message_tree.
 
@@ -563,17 +570,21 @@ class PromptRepository:
         distinct_message_trees = self.db.query(Message.message_tree_id).distinct(Message.message_tree_id)
         if require_role:
             distinct_message_trees = distinct_message_trees.filter(Message.role == require_role)
-        if reviewed:
-            distinct_message_trees = distinct_message_trees.filter(Message.review_result)
+        if review_result is not None:
+            distinct_message_trees = distinct_message_trees.filter(Message.review_result == review_result)
         distinct_message_trees = distinct_message_trees.subquery()
 
         random_message_tree_id = self.db.query(distinct_message_trees).order_by(func.random()).limit(1).scalar()
         if random_message_tree_id:
-            return self.fetch_message_tree(random_message_tree_id, reviewed)
+            return self.fetch_message_tree(random_message_tree_id, review_result=review_result, deleted=deleted)
         return None
 
     def fetch_random_conversation(
-        self, last_message_role: str = None, message_tree_id: Optional[UUID] = None, reviewed: bool = True
+        self,
+        last_message_role: str = None,
+        message_tree_id: Optional[UUID] = None,
+        review_result: Optional[bool] = True,
+        deleted: Optional[bool] = False,
     ) -> list[Message]:
         """
         Picks a random linear conversation starting from any root message
@@ -585,9 +596,11 @@ class PromptRepository:
             needs to have "assistant" role.
         """
         if message_tree_id:
-            messages_tree = self.fetch_message_tree(message_tree_id, reviewed)
+            messages_tree = self.fetch_message_tree(message_tree_id, review_result=review_result, deleted=deleted)
         else:
-            messages_tree = self.fetch_random_message_tree(last_message_role)
+            messages_tree = self.fetch_random_message_tree(
+                last_message_role, review_result=review_result, deleted=deleted
+            )
         if not messages_tree:
             raise OasstError("No message tree found", OasstErrorCode.NO_MESSAGE_TREE_FOUND)
 
@@ -613,13 +626,16 @@ class PromptRepository:
         return messages
 
     def fetch_message_tree(
-        self, message_tree_id: UUID, reviewed: bool = True, include_deleted: bool = False
+        self,
+        message_tree_id: UUID,
+        review_result: Optional[bool] = True,
+        deleted: Optional[bool] = False,
     ) -> list[Message]:
         qry = self.db.query(Message).filter(Message.message_tree_id == message_tree_id)
-        if reviewed:
-            qry = qry.filter(Message.review_result)
-        if not include_deleted:
-            qry = qry.filter(not_(Message.deleted))
+        if review_result is not None:
+            qry = qry.filter(Message.review_result == review_result)
+        if deleted is not None:
+            qry = qry.filter(Message.deleted == deleted)
         return self._add_user_emojis_all(qry)
 
     def check_users_recent_replies_for_duplicates(self, text: str) -> bool:
@@ -655,12 +671,6 @@ class PromptRepository:
         if not include_deleted:
             qry = qry.filter(not_(Message.deleted))
         return self._add_user_emojis_all(qry)
-
-    def fetch_message_trees_ready_for_export(self) -> list[MessageTreeState]:
-        qry = self.db.query(MessageTreeState).filter(
-            MessageTreeState.state == message_tree_state.State.READY_FOR_EXPORT
-        )
-        return qry.all()
 
     def fetch_multiple_random_replies(self, max_size: int = 5, message_role: str = None):
         """
@@ -758,14 +768,19 @@ class PromptRepository:
         tree_messages = self.fetch_message_tree(message.message_tree_id)
         return self.trace_conversation(tree_messages, message)
 
-    def fetch_tree_from_message(self, message: Message | UUID) -> list[Message]:
+    def fetch_tree_from_message(
+        self,
+        message: Message | UUID,
+        review_result: Optional[bool] = True,
+        deleted: Optional[bool] = False,
+    ) -> list[Message]:
         """
         Fetch message tree this message belongs to.
         """
         if isinstance(message, UUID):
             message = self.fetch_message(message)
         logger.debug(f"fetch_message_tree({message.message_tree_id=})")
-        return self.fetch_message_tree(message.message_tree_id)
+        return self.fetch_message_tree(message.message_tree_id, review_result=review_result, deleted=deleted)
 
     def fetch_message_children(
         self,
@@ -876,6 +891,7 @@ class PromptRepository:
             user_emojis = x["user_emojis"]
             if user_emojis:
                 m._user_emojis = user_emojis.split(",")
+            m._user_is_author = self.user_id and self.user_id == m.user_id
             messages.append(m)
         return messages
 
@@ -891,6 +907,7 @@ class PromptRepository:
         lt_id: Optional[UUID] = None,
         only_roots: bool = False,
         deleted: Optional[bool] = None,
+        review_result: Optional[bool] = None,
         desc: bool = False,
         limit: Optional[int] = 100,
         lang: Optional[str] = None,
@@ -950,6 +967,12 @@ class PromptRepository:
         if deleted is not None:
             qry = qry.filter(Message.deleted == deleted)
 
+        if review_result is not None:
+            qry = qry.filter(Message.review_result == review_result)
+
+        if lang is not None:
+            qry = qry.filter(Message.lang == lang)
+
         if desc:
             qry = qry.order_by(Message.created_date.desc(), Message.id.desc())
         else:
@@ -957,9 +980,6 @@ class PromptRepository:
 
         if limit is not None:
             qry = qry.limit(limit)
-
-        if lang is not None:
-            qry = qry.filter(Message.lang == lang)
 
         return self._add_user_emojis_all(qry)
 
@@ -1090,6 +1110,22 @@ WHERE message.id = cc.id;
                     message_id, protocol_schema.EmojiOp.remove, protocol_schema.EmojiCode.thumbs_up
                 )
 
+            if message.user_id == self.user_id and emoji in (
+                protocol_schema.EmojiCode.thumbs_up,
+                protocol_schema.EmojiCode.thumbs_down,
+            ):
+                logger.debug(f"Ignoring add emoji op for user's own message ({emoji=})")
+                return message
+
+            # Add to flagged_message table if the red flag emoji is applied
+            if emoji == protocol_schema.EmojiCode.red_flag:
+                flagged_message = FlaggedMessage(message_id=message_id, processed=False, created_date=utcnow())
+                insert_stmt = pg.insert(FlaggedMessage).values(**flagged_message.dict())
+                upsert_stmt = insert_stmt.on_conflict_do_update(
+                    constraint="flagged_message_pkey", set_=flagged_message.dict()
+                )
+                self.db.execute(upsert_stmt)
+
             # insert emoji record & increment count
             message_emoji = MessageEmoji(message_id=message.id, user_id=self.user_id, emoji=emoji)
             self.db.add(message_emoji)
@@ -1124,4 +1160,24 @@ WHERE message.id = cc.id;
         flag_modified(message, "emojis")
         self.db.add(message)
         self.db.flush()
+        return message
+
+    def fetch_flagged_messages(self, max_count: Optional[int]) -> list[FlaggedMessage]:
+        qry = self.db.query(FlaggedMessage)
+        if max_count is not None:
+            qry = qry.limit(max_count)
+
+        return qry.all()
+
+    def process_flagged_message(self, message_id: UUID) -> FlaggedMessage:
+
+        message = self.db.query(FlaggedMessage).get(message_id)
+
+        if not message:
+            raise OasstError("Message not found", OasstErrorCode.MESSAGE_NOT_FOUND, HTTPStatus.NOT_FOUND)
+
+        message.processed = True
+        self.db.commit()
+        self.db.refresh(message)
+
         return message

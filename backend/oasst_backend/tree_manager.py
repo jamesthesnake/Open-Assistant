@@ -1,6 +1,4 @@
-import json
 import random
-import sys
 from datetime import datetime, timedelta
 from enum import Enum
 from http import HTTPStatus
@@ -10,7 +8,6 @@ from uuid import UUID
 import numpy as np
 import pydantic
 import sqlalchemy as sa
-from fastapi.encoders import jsonable_encoder
 from loguru import logger
 from oasst_backend.api.v1.utils import prepare_conversation, prepare_conversation_message_list
 from oasst_backend.config import TreeManagerConfiguration, settings
@@ -25,8 +22,12 @@ from oasst_backend.models import (
     message_tree_state,
 )
 from oasst_backend.prompt_repository import PromptRepository
-from oasst_backend.utils import tree_export
-from oasst_backend.utils.database_utils import CommitMode, async_managed_tx_method, managed_tx_method
+from oasst_backend.utils.database_utils import (
+    CommitMode,
+    async_managed_tx_method,
+    managed_tx_function,
+    managed_tx_method,
+)
 from oasst_backend.utils.hugging_face import HfClassificationModel, HfEmbeddingModel, HfUrl, HuggingFaceAPI
 from oasst_backend.utils.ranking import ranked_pairs
 from oasst_shared.exceptions.oasst_api_error import OasstError, OasstErrorCode
@@ -218,76 +219,91 @@ class TreeManager:
 
         return task_count_by_type
 
-    def _prompt_lottery(self, lang: str) -> int:
-        MAX_RETRIES = 5
-        retry = 0
+    def _prompt_lottery(self, lang: str, max_activate: int = 1) -> int:
+        # Under high load the DB runs into deadlocks when many trees are released
+        # simultaneously (happens whens the max_active_trees setting is increased).
+        # To reduce the chance of write conflicts during updates of rows in the
+        # message_tree_state table we limit the number of trees that are activated
+        # per _prompt_lottery() call to max_activate.
+        activated = 0
+
         while True:
 
             stats = self.tree_counts_by_state_stats(lang=lang, only_active=True)
 
             remaining_prompt_review = max(0, self.cfg.max_initial_prompt_review - stats.initial_prompt_review)
             num_missing_growing = max(0, self.cfg.max_active_trees - stats.growing)
-            logger.debug(f"_prompt_lottery {remaining_prompt_review=}, {num_missing_growing=}")
+            logger.info(f"_prompt_lottery {remaining_prompt_review=}, {num_missing_growing=}")
 
-            if num_missing_growing == 0:
-                return remaining_prompt_review
-
-            # select among distinct users
-            authors_qry = (
-                self.db.query(Message.user_id)
-                .select_from(MessageTreeState)
-                .join(Message, MessageTreeState.message_tree_id == Message.id)
-                .filter(
-                    MessageTreeState.state == message_tree_state.State.PROMPT_LOTTERY_WAITING,
-                    Message.lang == lang,
-                    not_(Message.deleted),
-                    Message.review_result,
-                )
-                .distinct(Message.user_id)
-            )
-
-            author_ids = authors_qry.all()
-            if len(author_ids) == 0:
-                logger.info(
-                    f"No prompts for prompt lottery available ({num_missing_growing=}, trees missing for {lang=})."
-                )
+            if num_missing_growing == 0 or activated >= max_activate:
                 return num_missing_growing + remaining_prompt_review
 
-            # first select an authour
-            prompt_author_id: UUID = random.choice(author_ids)["user_id"]
-            logger.info(f"Selected random prompt author {prompt_author_id} among {len(author_ids)} candidates.")
-
-            # select random prompt of author
-            qry = (
-                self.db.query(MessageTreeState, Message)
-                .select_from(MessageTreeState)
-                .join(Message, MessageTreeState.message_tree_id == Message.id)
-                .filter(
-                    MessageTreeState.state == message_tree_state.State.PROMPT_LOTTERY_WAITING,
-                    Message.user_id == prompt_author_id,
-                    Message.lang == lang,
-                    not_(Message.deleted),
-                    Message.review_result,
+            @managed_tx_function(CommitMode.COMMIT)
+            def activate_one(db: Session) -> int:
+                # select among distinct users
+                authors_qry = (
+                    db.query(Message.user_id)
+                    .select_from(MessageTreeState)
+                    .join(Message, MessageTreeState.message_tree_id == Message.id)
+                    .filter(
+                        MessageTreeState.state == message_tree_state.State.PROMPT_LOTTERY_WAITING,
+                        Message.lang == lang,
+                        not_(Message.deleted),
+                        Message.review_result,
+                    )
+                    .distinct(Message.user_id)
                 )
-                .limit(100)
-            )
 
-            prompt_candidates = qry.all()
-            if len(prompt_candidates) == 0:
-                retry += 1  # not sure if this can happen with repeatable read isolation level, just in case we retry
-                if retry < MAX_RETRIES:
-                    continue
-                else:
-                    logger.warning("Max retries in prompt lottery reached.")
-                    return num_missing_growing + remaining_prompt_review
+                author_ids = authors_qry.all()
+                if len(author_ids) == 0:
+                    logger.info(
+                        f"No prompts for prompt lottery available ({num_missing_growing=}, trees missing for {lang=})."
+                    )
+                    return False
 
-            winner_prompt = random.choice(prompt_candidates)
-            message: Message = winner_prompt.Message
-            logger.info(f"Prompt lottery winner: {message.id=}")
+                # first select an authour
+                prompt_author_id: UUID = random.choice(author_ids)["user_id"]
+                logger.info(f"Selected random prompt author {prompt_author_id} among {len(author_ids)} candidates.")
 
-            mts: MessageTreeState = winner_prompt.MessageTreeState
-            self._enter_state(mts, message_tree_state.State.GROWING)
-            self.db.flush()
+                # select random prompt of author
+                qry = (
+                    db.query(MessageTreeState, Message)
+                    .select_from(MessageTreeState)
+                    .join(Message, MessageTreeState.message_tree_id == Message.id)
+                    .filter(
+                        MessageTreeState.state == message_tree_state.State.PROMPT_LOTTERY_WAITING,
+                        Message.user_id == prompt_author_id,
+                        Message.lang == lang,
+                        not_(Message.deleted),
+                        Message.review_result,
+                    )
+                    .limit(100)
+                )
+
+                prompt_candidates = qry.all()
+                if len(prompt_candidates) == 0:
+                    logger.warning("No prompt candidates of selected author found.")
+                    return False
+
+                winner_prompt = random.choice(prompt_candidates)
+                message: Message = winner_prompt.Message
+                logger.info(f"Prompt lottery winner: {message.id=}")
+
+                mts: MessageTreeState = winner_prompt.MessageTreeState
+                mts.state = message_tree_state.State.GROWING
+                mts.active = True
+                db.add(mts)
+
+                if mts.won_prompt_lottery_date is None:
+                    mts.won_prompt_lottery_date = utcnow()
+                logger.info(f"Tree entered '{mts.state}' state ({mts.message_tree_id=})")
+
+                return True
+
+            if not activate_one():
+                return num_missing_growing + remaining_prompt_review
+
+            activated += 1
 
     def _auto_moderation(self, lang: str) -> None:
         if not self.cfg.auto_mod_enabled:
@@ -300,7 +316,7 @@ class TreeManager:
             if num_red_flag is not None and num_red_flag >= self.cfg.auto_mod_red_flags:
                 if m.parent_id is None:
                     logger.warning(
-                        f"[AUTO MOD] Halting tree {m.message_tree_id}, inital prompt got too many red flags ({m.emojis})."
+                        f"[AUTO MOD] Halting tree {m.message_tree_id}, initial prompt got too many red flags ({m.emojis})."
                     )
                     self.enter_low_grade_state(m.message_tree_id)
                 else:
@@ -322,7 +338,7 @@ class TreeManager:
             logger.warning("Task availability request without lang tag received, assuming lang='en'.")
 
         self._auto_moderation(lang=lang)
-        num_missing_prompts = self._prompt_lottery(lang=lang)
+        num_missing_prompts = self._prompt_lottery(lang=lang, max_activate=1)
         extendible_parents, _ = self.query_extendible_parents(lang=lang)
         prompts_need_review = self.query_prompts_need_review(lang=lang)
         replies_need_review = self.query_replies_need_review(lang=lang)
@@ -360,7 +376,7 @@ class TreeManager:
             logger.warning("Task request without lang tag received, assuming 'en'.")
 
         self._auto_moderation(lang=lang)
-        num_missing_prompts = self._prompt_lottery(lang=lang)
+        num_missing_prompts = self._prompt_lottery(lang=lang, max_activate=2)
 
         prompts_need_review = self.query_prompts_need_review(lang=lang)
         replies_need_review = self.query_replies_need_review(lang=lang)
@@ -542,14 +558,6 @@ class TreeManager:
 
             case TaskType.REPLY:
 
-                recent_reply_tasks = self.pr.task_repository.fetch_recent_reply_tasks(
-                    max_age=timedelta(seconds=self.cfg.recent_tasks_span_sec),
-                    done=False,
-                    skipped=False,
-                    limit=500,
-                )
-                recent_reply_task_parents = {t.parent_message_id for t in recent_reply_tasks}
-
                 if task_role == TaskRole.PROMPTER:
                     extendible_parents = list(filter(lambda x: x.parent_role == "assistant", extendible_parents))
                 elif task_role == TaskRole.ASSISTANT:
@@ -560,24 +568,17 @@ class TreeManager:
                     random_parent: ExtendibleParentRow = None
                     if self.cfg.p_lonely_child_extension > 0 and self.cfg.lonely_children_count > 1:
                         # check if we have extendible prompter parents with a small number of replies
-
                         lonely_children_parents = [
                             p
                             for p in extendible_parents
                             if 0 < p.active_children_count < self.cfg.lonely_children_count
                             and p.parent_role == "prompter"
-                            and p.parent_id not in recent_reply_task_parents
                         ]
                         if len(lonely_children_parents) > 0 and random.random() < self.cfg.p_lonely_child_extension:
                             random_parent = random.choice(lonely_children_parents)
 
                     if random_parent is None:
-                        # try to exclude parents for which tasks were recently handed out
-                        fresh_parents = [p for p in extendible_parents if p.parent_id not in recent_reply_task_parents]
-                        if len(fresh_parents) > 0:
-                            random_parent = random.choice(fresh_parents)
-                        else:
-                            random_parent = random.choice(extendible_parents)
+                        random_parent = random.choice(extendible_parents)
 
                     # fetch random conversation to extend
                     logger.debug(f"selected {random_parent=}")
@@ -776,7 +777,7 @@ class TreeManager:
                     self.activate_backlog_tree(lang=root_msg.lang)
 
                 if self.cfg.min_active_rankings_per_lang > 0:
-                    incomplete_rankings = self.query_incomplete_rankings(lang=root_msg.lang)
+                    incomplete_rankings = self.query_incomplete_rankings(lang=root_msg.lang, user_filter=False)
                     if len(incomplete_rankings) < self.cfg.min_active_rankings_per_lang:
                         self.activate_backlog_tree(lang=root_msg.lang)
         else:
@@ -875,7 +876,7 @@ class TreeManager:
                     logger.warning("The intersection of ranking results ID sets has less than two elements. Skipping.")
                     continue
 
-                # keep only elements in commond set
+                # keep only elements in common set
                 ordered_ids_list = [list(filter(lambda x: x in common_set, ids)) for ids in ordered_ids_list]
                 assert all(len(x) == len(common_set) for x in ordered_ids_list)
 
@@ -1035,7 +1036,9 @@ WHERE mts.active                        -- only consider active trees
     AND m.parent_id IS NOT NULL         -- ignore initial prompts
     AND me.message_id IS NULL           -- no skip ranking emoji for user
 GROUP BY m.parent_id, m.role, mts.message_tree_id
-HAVING COUNT(m.id) > 1 and MIN(m.ranking_count) < :num_required_rankings
+HAVING COUNT(m.id) > 1                                      -- more than one child
+    AND MIN(m.ranking_count) < :num_required_rankings       -- not complete
+    AND COUNT(m.id) FILTER (WHERE m.user_id = :rank_user_id) = 0 -- no self-ranking
 """
 
     _sql_find_incomplete_rankings_ex = f"""
@@ -1045,21 +1048,30 @@ SELECT ir.* FROM incomplete_rankings ir
     LEFT JOIN message_reaction mr ON ir.parent_id = mr.message_id AND mr.payload_type = 'RankingReactionPayload'
 GROUP BY ir.parent_id, ir.role, ir.children_count, ir.child_min_ranking_count, ir.completed_rankings,
     ir.message_tree_id
-HAVING(COUNT(mr.message_id) FILTER (WHERE mr.user_id = :user_id) = 0)
+HAVING COUNT(mr.message_id) FILTER (WHERE mr.user_id = :dupe_user_id) = 0
 """
 
-    def query_incomplete_rankings(self, lang: str) -> list[IncompleteRankingsRow]:
-        """Query parents which have childern that need further rankings"""
+    def query_incomplete_rankings(self, lang: str, user_filter: bool = True) -> list[IncompleteRankingsRow]:
+        """Query parents which have children that need further rankings"""
 
-        user_id = self.pr.user_id if not settings.DEBUG_ALLOW_DUPLICATE_TASKS else None
+        dupe_user_id = None
+        skip_user_id = None
+        rank_user_id = None
+        if user_filter:
+            if not settings.DEBUG_ALLOW_DUPLICATE_TASKS:
+                dupe_user_id = self.pr.user_id
+            if not settings.DEBUG_ALLOW_SELF_RANKING:
+                rank_user_id = self.pr.user_id
+            skip_user_id = self.pr.user_id
         r = self.db.execute(
             text(self._sql_find_incomplete_rankings_ex),
             {
                 "num_required_rankings": self.cfg.num_required_rankings,
-                "ranking_state": message_tree_state.State.RANKING,
                 "lang": lang,
-                "user_id": user_id,
-                "skip_user_id": self.pr.user_id,
+                "dupe_user_id": dupe_user_id,
+                "skip_user_id": skip_user_id,
+                "rank_user_id": rank_user_id,
+                "ranking_state": message_tree_state.State.RANKING,
                 "skip_ranking": protocol_schema.EmojiCode.skip_ranking,
             },
         )
@@ -1067,14 +1079,23 @@ HAVING(COUNT(mr.message_id) FILTER (WHERE mr.user_id = :user_id) = 0)
 
     _sql_find_extendible_parents = """
 -- find all extendible parent nodes
+WITH recent_reply_tasks (parent_message_id) AS (
+    -- recent incomplete tasks to exclude
+    SELECT parent_message_id FROM task
+    WHERE not done
+        AND not skipped
+        AND created_date > (CURRENT_TIMESTAMP - :recent_tasks_interval)
+        AND (payload_type = 'AssistantReplyPayload' OR payload_type = 'PrompterReplyPayload')
+)
 SELECT m.id as parent_id, m.role as parent_role, m.depth, m.message_tree_id, COUNT(c.id) active_children_count
 FROM message_tree_state mts
-    INNER JOIN message m ON mts.message_tree_id = m.message_tree_id	-- all elements of message tree
+    INNER JOIN message m ON mts.message_tree_id = m.message_tree_id     -- all elements of message tree
     LEFT JOIN message_emoji me ON
         (m.id = me.message_id
         AND :skip_user_id IS NOT NULL
         AND me.user_id = :skip_user_id
         AND me.emoji = :skip_reply)
+    LEFT JOIN recent_reply_tasks rrt ON m.id = rrt.parent_message_id    -- recent tasks
     LEFT JOIN message c ON m.id = c.parent_id  -- child nodes
 WHERE mts.active                        -- only consider active trees
     AND mts.state = :growing_state      -- message tree must be growing
@@ -1083,6 +1104,7 @@ WHERE mts.active                        -- only consider active trees
     AND m.review_result                 -- parent node must have positive review
     AND m.lang = :lang                  -- parent matches lang
     AND me.message_id IS NULL           -- no skip reply emoji for user
+    AND rrt.parent_message_id IS NULL   -- no recent reply task found
     AND NOT coalesce(c.deleted, FALSE)  -- don't count deleted children
     AND (c.review_result OR coalesce(c.review_count, 0) < :num_reviews_reply) -- don't count children with negative review but count elements under review
 GROUP BY m.id, m.role, m.depth, m.message_tree_id, mts.max_children_count
@@ -1105,6 +1127,7 @@ HAVING COUNT(c.id) < mts.max_children_count -- below maximum number of children
                 "user_id": user_id,
                 "skip_user_id": self.pr.user_id,
                 "skip_reply": protocol_schema.EmojiCode.skip_reply,
+                "recent_tasks_interval": timedelta(seconds=self.cfg.recent_tasks_span_sec),
             },
         )
 
@@ -1145,6 +1168,7 @@ HAVING COUNT(m.id) < mts.goal_tree_size
                 "user_id": user_id,
                 "skip_user_id": self.pr.user_id,
                 "skip_reply": protocol_schema.EmojiCode.skip_reply,
+                "recent_tasks_interval": timedelta(seconds=self.cfg.recent_tasks_span_sec),
             },
         )
         return [ActiveTreeSizeRow.from_orm(x) for x in r.all()]
@@ -1236,7 +1260,7 @@ LEFT JOIN message_reaction mr ON mr.task_id = t.id AND mr.payload_type = 'Rankin
 
     @managed_tx_method(CommitMode.COMMIT)
     def ensure_tree_states(self) -> None:
-        """Add message tree state rows for all root nodes (inital prompt messages)."""
+        """Add message tree state rows for all root nodes (initial prompt messages)."""
 
         missing_tree_ids = self.query_misssing_tree_states()
         for id in missing_tree_ids:
@@ -1578,7 +1602,7 @@ DELETE FROM message WHERE message_tree_id = :message_tree_id;
         total_messages = sum(len(x) for x in replies_by_tree.values())
         logger.debug(f"found: {len(replies_by_tree)} trees; {len(prompts)} prompts; {total_messages} messages;")
 
-        # remove all trees based on inital prompts of the user
+        # remove all trees based on initial prompts of the user
         if purge_initial_prompts:
             for p in prompts:
                 self.purge_message_tree(p.message_tree_id)
@@ -1616,7 +1640,7 @@ DELETE FROM message WHERE message_tree_id = :message_tree_id;
                     logger.debug(f"purging message: {m.id}")
                     self._purge_message_internal(m.id)
 
-            # update childern counts
+            # update children counts
             self.pr.update_children_counts(m.message_tree_id)
 
             # reactivate tree
@@ -1644,44 +1668,6 @@ DELETE FROM user_stats WHERE user_id = :user_id;
 
         if ban:
             self.db.execute(update(User).filter(User.id == user_id).values(deleted=True, enabled=False))
-
-    def export_trees_to_file(
-        self,
-        message_tree_ids: list[str],
-        file=None,
-        reviewed: bool = True,
-        include_deleted: bool = False,
-        use_compression: bool = False,
-    ) -> None:
-        trees_to_export: List[tree_export.ExportMessageTree] = []
-
-        for message_tree_id in message_tree_ids:
-            messages: List[Message] = self.pr.fetch_message_tree(message_tree_id, reviewed, include_deleted)
-            trees_to_export.append(tree_export.build_export_tree(message_tree_id, messages))
-
-        if file:
-            tree_export.write_trees_to_file(file, trees_to_export, use_compression)
-        else:
-            sys.stdout.write(json.dumps(jsonable_encoder(trees_to_export), indent=2))
-
-    def export_all_ready_trees(
-        self, file: str, reviewed: bool = True, include_deleted: bool = False, use_compression: bool = False
-    ) -> None:
-        message_tree_states: MessageTreeState = self.pr.fetch_message_trees_ready_for_export()
-        message_tree_ids = [ms.message_tree_id for ms in message_tree_states]
-        self.export_trees_to_file(message_tree_ids, file, reviewed, include_deleted, use_compression)
-
-    def export_all_user_trees(
-        self,
-        user_id: str,
-        file: str,
-        reviewed: bool = True,
-        include_deleted: bool = False,
-        use_compression: bool = False,
-    ) -> None:
-        messages = self.pr.fetch_user_message_trees(UUID(user_id))
-        message_tree_ids = [ms.message_tree_id for ms in messages]
-        self.export_trees_to_file(message_tree_ids, file, reviewed, include_deleted, use_compression)
 
     @managed_tx_method(CommitMode.COMMIT)
     def retry_scoring_failed_message_trees(self):
@@ -1749,5 +1735,3 @@ if __name__ == "__main__":
         # print(
         #     ".query_tree_ranking_results", tm.query_tree_ranking_results(UUID("21f9d585-d22c-44ab-a696-baa3d83b5f1b"))
         # )
-
-        # print(tm.export_trees_to_file(message_tree_ids=["7e75fb38-e664-4e2b-817c-b9a0b01b0074"], file="lol.jsonl"))

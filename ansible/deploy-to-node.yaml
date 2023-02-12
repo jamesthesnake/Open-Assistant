@@ -82,6 +82,7 @@
           interval: 2s
           timeout: 2s
           retries: 10
+        shm_size: 1G
       loop:
         - name: backend
         - name: web
@@ -169,6 +170,8 @@
         network_mode: "oasst-{{ stack_name }}"
         env:
           ADMIN_USERS: "{{ lookup('ansible.builtin.env', 'WEB_ADMIN_USERS') }}"
+          MODERATOR_USERS:
+            "{{ lookup('ansible.builtin.env', 'WEB_MODERATOR_USERS') }}"
           DATABASE_URL:
             "postgres://postgres:{{ postgres_password }}@oasst-{{ stack_name
             }}-postgres-web/postgres"
@@ -186,7 +189,7 @@
             "{{ lookup('ansible.builtin.env', 'WEB_EMAIL_SERVER_PORT') }}"
           EMAIL_SERVER_USER:
             "{{ lookup('ansible.builtin.env', 'WEB_EMAIL_SERVER_USER') }}"
-          FASTAPI_URL: "http://oasst-{{ stack_name }}-backend:8080"
+          FASTAPI_URL: "{{ lookup('ansible.builtin.env', 'BACKEND_URL') }}"
           FASTAPI_KEY: "{{ web_api_key }}"
           NEXTAUTH_SECRET:
             "{{ lookup('ansible.builtin.env', 'WEB_NEXTAUTH_SECRET') }}"
@@ -205,6 +208,8 @@
           NEXT_PUBLIC_ENABLE_EMAIL_SIGNIN:
             "{{ lookup('ansible.builtin.env',
             'WEB_NEXT_PUBLIC_ENABLE_EMAIL_SIGNIN') }}"
+          MAINTENANCE_MODE:
+            "{{ lookup('ansible.builtin.env', 'MAINTENANCE_MODE') }}"
         ports:
           - "{{ website_port }}:3000"
         command: bash wait-for-postgres.sh node server.js

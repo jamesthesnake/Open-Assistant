@@ -8,7 +8,6 @@ import { get } from "src/lib/api";
 import { AvailableTasks, TaskCategory } from "src/types/Task";
 export { getDefaultStaticProps as getStaticProps } from "src/lib/default_static_props";
 import { TaskCategoryItem } from "src/components/Dashboard/TaskOption";
-import { ToSWrapper } from "src/components/ToSWrapper";
 import useSWR from "swr";
 
 const Dashboard = () => {
@@ -46,11 +45,9 @@ const Dashboard = () => {
         <meta name="description" content="Chat with Open Assistant and provide feedback." key="description" />
       </Head>
       <Flex direction="column" gap="10">
-        <ToSWrapper>
-          <WelcomeCard />
-          <TaskOption content={availableTaskTypes} />
-          <LeaderboardWidget />
-        </ToSWrapper>
+        <WelcomeCard />
+        <TaskOption content={availableTaskTypes} />
+        <LeaderboardWidget />
       </Flex>
     </>
   );
